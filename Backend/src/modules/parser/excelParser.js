@@ -11,9 +11,10 @@ class ExcelParser {
   /**
    * Parses an Excel or CSV file and retrieves valid contacts.
    * @param {string} filePath - Absolute path to the file.
+   * @param {string} originalFilename - Original filename to detect extension.
    * @returns {Promise<{contacts: Array, errors: Array}>}
    */
-  async parse(filePath) {
+  async parse(filePath, originalFilename) {
     const workbook = new ExcelJS.Workbook();
     const validContacts = [];
     const errors = [];
@@ -21,8 +22,11 @@ class ExcelParser {
     try {
       logger.info(`Starting parser for: ${filePath}`);
 
-      // Auto-detect format based on extension
-      if (filePath.endsWith('.csv')) {
+      // Auto-detect format based on extension (check original name first)
+      const isCsv = (originalFilename && originalFilename.toLowerCase().endsWith('.csv')) || 
+                    filePath.toLowerCase().endsWith('.csv');
+
+      if (isCsv) {
         await workbook.csv.readFile(filePath);
       } else {
         await workbook.xlsx.readFile(filePath);

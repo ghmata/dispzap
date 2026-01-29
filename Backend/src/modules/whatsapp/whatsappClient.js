@@ -17,6 +17,7 @@ class WhatsAppClient {
         clientId: id,
         dataPath: sessionPath
       }),
+      // Reverted: v1.26.0 should work natively. Forcing old version might be the issue.
       puppeteer: {
         headless: true,
         args: [
@@ -55,21 +56,12 @@ class WhatsAppClient {
       logger.info(`[${this.id}] Client authenticated.`);
       
       // Fallback: If READY doesn't fire in 30s, check if we can actually use the client
+      // Fallback: If READY doesn't fire in 30s, check if we can actually use the client
+      // WARNING: Forcing READY without the event caused crashes (sendSeen undefined).
+      // We will only log the delay, not force state.
       setTimeout(async () => {
           if (this.status === 'AUTHENTICATED') {
-              logger.warn(`[${this.id}] READY event timeout. Checking validity...`);
-              try {
-                  // Try to get state or internal WWebJS ready status
-                  const state = await this.client.getState();
-                  logger.info(`[${this.id}] Forced check state: ${state}`);
-                  if (state === 'CONNECTED') {
-                      this.status = 'READY';
-                      this.client.emit('ready'); // Emit manually to trigger listeners
-                      logger.info(`[${this.id}] Manually set to READY via fallback.`);
-                  }
-              } catch (e) {
-                  logger.error(`[${this.id}] Fallback check failed: ${e.message}`);
-              }
+              logger.warn(`[${this.id}] WAITING FOR READY... (Client stalled at AUTHENTICATED). This usually means the session is corrupt or WWebJS needs an update.`);
           }
       }, 30000);
     });
@@ -105,7 +97,29 @@ class WhatsAppClient {
     if (this.status !== 'READY') {
       throw new Error(`Client ${this.id} is not ready (Status: ${this.status})`);
     }
-    return this.client.sendMessage(to, message);
+    
+    // Resolve ID to avoid "No LID" error
+    let chatId = to;
+    
+    // If it looks like a phone number (digits only or digits+@c.us)
+    const cleanNumber = to.replace('@c.us', '');
+    if (/^\d+$/.test(cleanNumber)) {
+        try {
+            const registered = await this.client.getNumberId(cleanNumber);
+            if (registered) {
+                chatId = registered._serialized;
+            } else {
+                logger.warn(`[${this.id}] Number ${cleanNumber} not registered on WhatsApp. Attempting to send anyway...`);
+                chatId = `${cleanNumber}@c.us`;
+            }
+        } catch (e) {
+            logger.warn(`[${this.id}] ID Resolution failed for ${cleanNumber}: ${e.message}`);
+             // If resolution fails, fallback to standard format
+             chatId = `${cleanNumber}@c.us`;
+        }
+    }
+
+    return this.client.sendMessage(chatId, message);
   }
 
   isReady() {

@@ -153,7 +153,7 @@ class ApiServer {
 
             // Async start (Fire and Forget)
             campaignManager.initialize().then(() => {
-                return campaignManager.startCampaign(file.path, message);
+                return campaignManager.startCampaign(file.path, message, file.originalname);
             }).catch(err => {
                 logger.error(`Campaign Background Error: ${err.message}`);
                 this.io.emit('log', `[ERROR] Campaign Failed: ${err.message}`);

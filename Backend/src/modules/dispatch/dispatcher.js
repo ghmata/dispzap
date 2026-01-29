@@ -31,11 +31,15 @@ class Dispatcher {
     logger.info(`[${client.id}] Dispatching to ${phone}... (Typing: ${typingTime}ms, Next Delay: ${postSendDelay}ms)`);
 
     if (!dryRun) {
-        // Here we would call: await client.sendMessage(phone + '@c.us', finalMessage);
-        // But for Day 3 we focus on the logic, actual sending is Day 4 integration or verification.
-        // Wait for typing simulation
+        // Simulate typing delay for human-like behavior
         await new Promise(r => setTimeout(r, typingTime));
-        logger.info(`[${client.id}] Sent: "${finalMessage}"`);
+        
+        // REAL SENDING
+        // Ensure format is correct: 55... @c.us
+        const chatId = `${phone}@c.us`; 
+        await client.sendMessage(chatId, finalMessage);
+        
+        logger.info(`[${client.id}] Sent to ${phone}: "${finalMessage}"`);
     } else {
         logger.info(`[DRY-RUN] Would send: "${finalMessage}" via ${client.id}`);
     }

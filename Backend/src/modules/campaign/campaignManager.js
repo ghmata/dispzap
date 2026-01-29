@@ -10,7 +10,7 @@ const PathHelper = require('../utils/pathHelper');
 class CampaignManager {
   constructor() {
     this.sessionManager = new SessionManager();
-    this.loadBalancer = new LoadBalancer();
+    this.loadBalancer = new LoadBalancer(this.sessionManager);
     this.dispatcher = new Dispatcher(this.loadBalancer);
     this.parser = new ExcelParser();
     this.stateFile = PathHelper.resolve('data', 'campaign_state.json');
@@ -51,13 +51,12 @@ class CampaignManager {
     
     // Add sessions to LoadBalancer (filtering only ready ones ideally)
     // For now we assume they will connect.
-    sessions.forEach(s => {
-       // Ideally we check if s.status === 'READY'
-       // But as per Day 2, they might take time. 
-       // We'll add them and let LB filter by status if implemented, 
-       // or we explicitly wait here.
-       this.loadBalancer.addClient(s);
-    });
+    // sessions.forEach(s => {
+    //    this.loadBalancer.addClient(s);
+    // });
+    // FIXED: LoadBalancer now pulls directly from sessionManager via DI
+    
+    logger.info(`${sessions.length} sessions detected for Load Balancer.`);
 
     logger.info(`${sessions.length} sessions loaded into Load Balancer.`);
   }
@@ -67,11 +66,11 @@ class CampaignManager {
    * @param {string} excelPath 
    * @param {string} messageTemplate 
    */
-  async startCampaign(excelPath, messageTemplate) {
+  async startCampaign(excelPath, messageTemplate, originalFilename) {
     let state = this.loadState();
     
     // 1. Parse Excel
-    const parseResult = await this.parser.parse(excelPath);
+    const parseResult = await this.parser.parse(excelPath, originalFilename);
     if (parseResult.errors.length > 0) {
       logger.warn(`Found ${parseResult.errors.length} formatting errors in Excel. Check logs.`);
     }
