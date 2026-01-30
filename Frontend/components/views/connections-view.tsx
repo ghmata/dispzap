@@ -10,7 +10,13 @@ import { Plus, Loader2, RefreshCw } from "lucide-react";
 export function ConnectionsView() {
   const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
-  const { qrCodes, sessions, refreshSessions, addOptimisticSession } = useSocket();
+  const {
+    qrCodes,
+    sessions,
+    refreshSessions,
+    addOptimisticSession,
+    replaceOptimisticSession,
+  } = useSocket();
 
   // Load sessions on mount (sync with backend)
   useEffect(() => {
@@ -30,7 +36,15 @@ export function ConnectionsView() {
 
     setCreating(true);
     try {
-      await createSession(); // Context listens to socket events to update list
+      const response = await createSession();
+      if (response?.id) {
+        replaceOptimisticSession(tempId, {
+          id: response.id,
+          status: response.status ?? "LOADING",
+          displayOrder: sessions.length + 1,
+          name: "Gerando Novo Chip...",
+        });
+      }
     } catch (error) {
       console.error("[v0] Error creating session:", error);
       // TODO: Remove optimistic session on error if needed, 

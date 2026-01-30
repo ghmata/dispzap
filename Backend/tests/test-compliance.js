@@ -3,7 +3,7 @@ const ComplianceEngine = require('../src/modules/compliance/engine');
 const Dispatcher = require('../src/modules/dispatch/dispatcher');
 
 const MOCK_LB = {
-  getNextClient: () => ({ id: 'mock_chip_1' })
+  getNextClient: () => ({ id: 'mock_chip_1', waitUntilReady: async () => {}, sendMessage: async () => ({}) })
 };
 
 async function runDay3Validation() {
@@ -30,7 +30,11 @@ async function runDay3Validation() {
   // 3. Test Dispatch Flow
   console.log('\n[3] Testing Full Dispatch Flow (Dry Run)');
   const dispatcher = new Dispatcher(MOCK_LB);
-  const result = await dispatcher.dispatch('5511999999999', '{Olá|Oi} Teste de Envio', true);
+  const result = await dispatcher.dispatch({
+    phone: '5511999999999',
+    messageTemplate: '{Olá|Oi} Teste de Envio',
+    dryRun: true
+  });
   
   console.log('Dispatch Result:', result);
 

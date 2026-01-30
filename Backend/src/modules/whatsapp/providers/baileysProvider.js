@@ -48,6 +48,24 @@ class BaileysProvider extends WhatsAppProvider {
     this.socket.ev.on('creds.update', () => {
       this.emit('creds.update');
     });
+
+    this.socket.ev.on('messages.update', (updates) => {
+      updates.forEach((update) => {
+        const messageId = update.key?.id;
+        const status = update.update?.status;
+        if (!messageId || typeof status === 'undefined') {
+          return;
+        }
+        const mapped = this._mapReceiptStatus(status);
+        if (mapped) {
+          this.emit('message.status', {
+            messageId,
+            status: mapped,
+            timestamp: Date.now()
+          });
+        }
+      });
+    });
   }
 
   getDisconnectReason() {
@@ -102,6 +120,16 @@ class BaileysProvider extends WhatsAppProvider {
       throw new Error('Invalid phone number');
     }
     return digits;
+  }
+
+  _mapReceiptStatus(status) {
+    const mapping = {
+      1: 'SENT',
+      2: 'DELIVERED',
+      3: 'READ',
+      4: 'PLAYED'
+    };
+    return mapping[status] || null;
   }
 }
 

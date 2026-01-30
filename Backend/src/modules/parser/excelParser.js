@@ -1,11 +1,15 @@
 const ExcelJS = require('exceljs');
 const logger = require('../utils/logger');
+const { readCsvFile } = require('./csvParser');
+const { sanitizePhone, isValidPhone } = require('../utils/phone');
 
 class ExcelParser {
   constructor() {
-    this.requiredColumns = ['Nome', 'Telefone'];
-    // Valid International Format (Brazil): 55 + 2-digit Area Code + 8 or 9 digit number
-    this.phoneRegex = /^55\d{10,11}$/;
+    this.requiredColumns = ['nome', 'telefone'];
+    this.headerAliases = {
+      nome: ['nome', 'name'],
+      telefone: ['telefone', 'phone', 'celular', 'whatsapp']
+    };
   }
 
   /**
@@ -27,13 +31,60 @@ class ExcelParser {
                     filePath.toLowerCase().endsWith('.csv');
 
       if (isCsv) {
-        await workbook.csv.readFile(filePath);
-      } else {
-        await workbook.xlsx.readFile(filePath);
+        const rows = readCsvFile(filePath);
+        if (rows.length === 0) {
+          throw new Error('CSV is empty or cannot be read.');
+        }
+
+        const headerRow = rows[0];
+        const headerMap = this._mapHeaders(headerRow);
+        this._validateHeaders(headerMap, headerRow);
+
+        let processedRows = 0;
+        rows.slice(1).forEach((row, index) => {
+          const rowNumber = index + 2;
+          try {
+            const rawName = this._getCsvValue(row, headerMap.nome);
+            const rawPhone = this._getCsvValue(row, headerMap.telefone);
+
+            if (!rawName && !rawPhone) {
+              return;
+            }
+
+            const validation = this._validateRow(rawName, rawPhone);
+            if (validation.isValid) {
+              const variables = this._extractCsvVariables(row, headerMap, headerRow);
+              validContacts.push({
+                row: rowNumber,
+                name: rawName,
+                phone: validation.cleanPhone,
+                ...variables
+              });
+            } else {
+              errors.push({
+                row: rowNumber,
+                error: validation.error,
+                data: { name: rawName, phone: rawPhone }
+              });
+            }
+
+            processedRows += 1;
+          } catch (rowError) {
+            errors.push({
+              row: rowNumber,
+              error: `Unexpected Parsing Error: ${rowError.message}`
+            });
+          }
+        });
+
+        logger.info(`Parsing complete. Processed: ${processedRows}. Valid: ${validContacts.length}. Errors: ${errors.length}.`);
+        return { contacts: validContacts, errors };
       }
 
+      await workbook.xlsx.readFile(filePath);
+
       const worksheet = workbook.getWorksheet(1); // Get first sheet
-      
+
       if (!worksheet) {
         throw new Error('Workbook is empty or cannot be read.');
       }
@@ -51,11 +102,8 @@ class ExcelParser {
         }
       });
 
-      // Validate Required Columns
-      const missingColumns = this.requiredColumns.filter(col => !columnMap[col]);
-      if (missingColumns.length > 0) {
-        throw new Error(`Missing required columns: ${missingColumns.join(', ')}. Found: ${headersFound.join(', ')}`);
-      }
+      const normalizedMap = this._normalizeColumnMap(columnMap);
+      this._validateHeaders(normalizedMap, headersFound);
 
       // Iterate Rows (Data starts at row 2)
       let processedRows = 0;
@@ -64,9 +112,9 @@ class ExcelParser {
 
         try {
           // Extract Data
-          const rawName = this._getCellValue(row, columnMap['Nome']);
-          const rawPhone = this._getCellValue(row, columnMap['Telefone']);
-          
+          const rawName = this._getCellValue(row, normalizedMap.nome);
+          const rawPhone = this._getCellValue(row, normalizedMap.telefone);
+
           if (!rawName && !rawPhone) {
              // Empty row, skip silently or log distinct debug
              return; 
@@ -78,9 +126,9 @@ class ExcelParser {
           if (validation.isValid) {
             // Extract optional dynamic variables (all other columns)
             const variables = {};
-            Object.keys(columnMap).forEach(header => {
+            Object.keys(normalizedMap).forEach(header => {
               if (!this.requiredColumns.includes(header)) {
-                variables[header] = this._getCellValue(row, columnMap[header]);
+                variables[header] = this._getCellValue(row, normalizedMap[header]);
               }
             });
 
@@ -123,6 +171,64 @@ class ExcelParser {
     return cell.text ? cell.text.trim() : (cell.value ? cell.value.toString().trim() : '');
   }
 
+  _getCsvValue(row, colIndex) {
+    if (!colIndex && colIndex !== 0) return '';
+    const value = row[colIndex] ?? '';
+    return String(value).trim();
+  }
+
+  _normalizeColumnMap(columnMap) {
+    const normalized = {};
+    Object.entries(columnMap).forEach(([header, colNumber]) => {
+      const key = this._resolveHeader(header);
+      if (key) {
+        normalized[key] = colNumber;
+      } else {
+        normalized[header] = colNumber;
+      }
+    });
+    return normalized;
+  }
+
+  _mapHeaders(headers) {
+    const normalized = {};
+    headers.forEach((header, index) => {
+      const key = this._resolveHeader(header);
+      if (key) {
+        normalized[key] = index;
+      } else if (header) {
+        normalized[header] = index;
+      }
+    });
+    return normalized;
+  }
+
+  _resolveHeader(header) {
+    const normalizedHeader = String(header || '').trim().toLowerCase();
+    if (!normalizedHeader) return null;
+    const match = Object.entries(this.headerAliases).find(([, aliases]) =>
+      aliases.includes(normalizedHeader)
+    );
+    return match ? match[0] : null;
+  }
+
+  _validateHeaders(columnMap, headersFound) {
+    const missingColumns = this.requiredColumns.filter(col => !columnMap[col]);
+    if (missingColumns.length > 0) {
+      throw new Error(`Missing required columns: ${missingColumns.join(', ')}. Found: ${headersFound.join(', ')}`);
+    }
+  }
+
+  _extractCsvVariables(row, headerMap, headers) {
+    const variables = {};
+    Object.entries(headerMap).forEach(([key, index]) => {
+      if (this.requiredColumns.includes(key)) return;
+      const headerLabel = headers[index];
+      variables[headerLabel] = this._getCsvValue(row, index);
+    });
+    return variables;
+  }
+
   _validateRow(name, phone) {
     if (!name) {
       return { isValid: false, error: 'Missing Name' };
@@ -131,24 +237,12 @@ class ExcelParser {
       return { isValid: false, error: 'Missing Phone' };
     }
 
-    const cleanPhone = this._sanitizePhone(phone);
-    if (!this.phoneRegex.test(cleanPhone)) {
+    const cleanPhone = sanitizePhone(phone);
+    if (!isValidPhone(cleanPhone)) {
       return { isValid: false, error: `Invalid Phone Format: ${cleanPhone}. Expected 55DDD9XXXXXXXX` };
     }
 
     return { isValid: true, cleanPhone };
-  }
-
-  _sanitizePhone(phone) {
-    let clean = phone.replace(/\D/g, ''); // Remove non-digits
-    
-    // Auto-fix common issues if needed (Day 1 requirement: Sanitization)
-    // If user enters '11999998888', assume 55
-    if ((clean.length === 10 || clean.length === 11) && !clean.startsWith('55')) {
-       clean = '55' + clean;
-    }
-
-    return clean;
   }
 }
 

@@ -1,5 +1,6 @@
 const logger = require('../utils/logger');
-const SpintaxParser = require('../campaign/spintax');
+const { applyTemplate } = require('../campaign/templateEngine');
+const { formatCorrelationTag } = require('../utils/correlation');
 const ComplianceEngine = require('../compliance/engine');
 
 class Dispatcher {
@@ -10,13 +11,26 @@ class Dispatcher {
 
   /**
    * Dispatches a single message with full Anti-Ban logic.
-   * @param {string} phone - Target phone (55...)
-   * @param {string} messageTemplate - Message with Spintax
-   * @param {boolean} dryRun - If true, simulates sending.
+   * @param {object} payload - Dispatch payload.
+   * @param {string} payload.phone - Target phone (55...)
+   * @param {string} payload.messageTemplate - Message with Spintax
+   * @param {object} payload.variables - Variables to render
+   * @param {object} payload.correlation - Correlation metadata
+   * @param {object} payload.delayConfig - Delay override (ms)
+   * @param {boolean} payload.dryRun - If true, simulates sending.
    */
-  async dispatch(phone, messageTemplate, dryRun = false) {
-    // 1. Resolve Spintax
-    const finalMessage = SpintaxParser.parse(messageTemplate);
+  async dispatch({
+    phone,
+    messageTemplate,
+    variables = {},
+    correlation = {},
+    delayConfig = {},
+    dryRun = false
+  }) {
+    const correlationTag = formatCorrelationTag(correlation.correlationId);
+
+    // 1. Resolve Template + Spintax
+    const finalMessage = applyTemplate(messageTemplate, variables);
     
     // 2. Select Chip (Load Balancing)
     const client = this.loadBalancer.getNextClient();
@@ -29,30 +43,35 @@ class Dispatcher {
     }
 
     // 3. Calculate Delays (Anti-Ban)
+    this.compliance.setDelayRange(delayConfig);
     const typingTime = this.compliance.getTypingDelay(finalMessage);
     const postSendDelay = this.compliance.getVariableDelay();
 
-    logger.info(`[${client.id}] Dispatching to ${phone}... (Typing: ${typingTime}ms, Next Delay: ${postSendDelay}ms)`);
+    logger.info(`${correlationTag} [${client.id}] Dispatching to ${phone}... (Typing: ${typingTime}ms, Next Delay: ${postSendDelay}ms)`);
 
+    let sendResult;
     if (!dryRun) {
         // Simulate typing delay for human-like behavior
         await new Promise(r => setTimeout(r, typingTime));
         
         // REAL SENDING
-        await client.sendMessage(phone, finalMessage);
+        sendResult = await client.sendMessage(phone, finalMessage, correlation);
         
-        logger.info(`[${client.id}] Sent to ${phone}: "${finalMessage}"`);
+        logger.info(`${correlationTag} [${client.id}] Sent to ${phone}: "${finalMessage}"`);
         if (client.enterCooldown) {
           await client.enterCooldown(postSendDelay, 'post_send_delay');
         }
     } else {
-        logger.info(`[DRY-RUN] Would send: "${finalMessage}" via ${client.id}`);
+        logger.info(`${correlationTag} [DRY-RUN] Would send: "${finalMessage}" via ${client.id}`);
     }
 
     return {
-      status: 'SENT',
+      status: 'SERVER_ACK',
       chip: client.id,
       message: finalMessage,
+      clientMessageId: correlation.clientMessageId,
+      messageId: sendResult?.messageId,
+      jid: sendResult?.jid,
       delays: { typing: typingTime, wait: postSendDelay }
     };
   }
