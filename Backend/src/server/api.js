@@ -92,7 +92,7 @@ class ApiServer {
 
     // Helper to attach Socket listeners to a client
     this.attachClientListeners = (waClient) => {
-        if (!waClient || !waClient.client) return;
+        if (!waClient) return;
         const id = waClient.id;
         const socketIo = this.io;
 
@@ -102,17 +102,16 @@ class ApiServer {
         
         // Check if already ready/authenticated (for restored sessions)
         if (waClient.status === 'READY') {
-             setTimeout(() => {
-                socketIo.emit('session_change', { chipId: id, status: 'READY' });
-             }, 500);
-        } else if (waClient.status === 'AUTHENTICATED' || waClient.status === 'CONNECTING') {
-            // If restoring, it might be connecting
-             setTimeout(() => {
-                socketIo.emit('session_change', { chipId: id, status: 'SYNCING' });
-             }, 500);
+          setTimeout(() => {
+            socketIo.emit('session_change', { chipId: id, status: 'READY' });
+          }, 500);
+        } else if (waClient.status === 'AUTHENTICATING') {
+          setTimeout(() => {
+            socketIo.emit('session_change', { chipId: id, status: 'SYNCING' });
+          }, 500);
         }
 
-        waClient.client.on('qr', async (qr) => {
+        waClient.on('qr', async (qr) => {
             logger.info(`[Socket] Emitting QR for ${id}`);
             try {
                 const dataUrl = await QRCode.toDataURL(qr);
@@ -122,25 +121,9 @@ class ApiServer {
             }
         });
 
-        waClient.client.on('loading_screen', () => {
-            socketIo.emit('session_change', { chipId: id, status: 'LOADING' });
-        });
-
-        waClient.client.on('ready', () => {
-             logger.info(`[Socket] Emitting READY for ${id}`);
-             socketIo.emit('session_change', { chipId: id, status: 'READY' });
-        });
-
-        waClient.client.on('authenticated', () => {
-             socketIo.emit('session_change', { chipId: id, status: 'SYNCING' });
-        });
-        
-        waClient.client.on('disconnected', () => {
-             socketIo.emit('session_change', { chipId: id, status: 'DISCONNECTED' });
-        });
-
-        waClient.client.on('auth_failure', () => {
-             socketIo.emit('session_change', { chipId: id, status: 'ERROR' });
+        waClient.on('status', ({ status }) => {
+          logger.info(`[Socket] Emitting ${status} for ${id}`);
+          socketIo.emit('session_change', { chipId: id, status });
         });
     };
 

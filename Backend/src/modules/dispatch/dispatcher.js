@@ -39,11 +39,12 @@ class Dispatcher {
         await new Promise(r => setTimeout(r, typingTime));
         
         // REAL SENDING
-        // Ensure format is correct: 55... @c.us
-        const chatId = `${phone}@c.us`; 
-        await client.sendMessage(chatId, finalMessage);
+        await client.sendMessage(phone, finalMessage);
         
         logger.info(`[${client.id}] Sent to ${phone}: "${finalMessage}"`);
+        if (client.enterCooldown) {
+          await client.enterCooldown(postSendDelay, 'post_send_delay');
+        }
     } else {
         logger.info(`[DRY-RUN] Would send: "${finalMessage}" via ${client.id}`);
     }
