@@ -1,35 +1,41 @@
 const assert = require('assert');
-const LoadBalancer = require('../src/modules/whatsapp/loadBalancer');
-const Dispatcher = require('../src/modules/dispatch/dispatcher');
+const EventEmitter = require('events');
+const WhatsAppClient = require('../src/modules/whatsapp/whatsappClient');
 
 (async () => {
-  let waitCalled = false;
   let sendCalled = false;
 
-  const mockClient = {
-    id: 'chip_mock',
-    isReady: () => true,
-    waitUntilReady: async () => {
-      waitCalled = true;
-    },
-    sendMessage: async () => {
+  class MockProvider extends EventEmitter {
+    async initialize() {}
+    async validateNumber(number) {
+      return { jid: `${number}@s.whatsapp.net`, exists: true };
+    }
+    async sendMessage() {
       sendCalled = true;
-    },
-  };
+      return { key: { id: 'mock' } };
+    }
+    getPhoneNumber() {
+      return '5511999999999';
+    }
+    getDisplayName() {
+      return 'Mock';
+    }
+  }
 
-  const sessionManager = {
-    getActiveSessions: () => [mockClient],
-  };
+  const client = new WhatsAppClient('chip_mock', {
+    provider: new MockProvider(),
+    complianceConfig: {
+      maxMessagesPerHour: 10,
+      maxMessagesPerDay: 10
+    }
+  });
 
-  const balancer = new LoadBalancer(sessionManager);
-  const dispatcher = new Dispatcher(balancer);
+  client._transition('AUTHENTICATING', 'test');
+  client._transition('CONNECTED', 'test');
+  client._transition('READY', 'test');
 
-  dispatcher.compliance.getTypingDelay = () => 0;
-  dispatcher.compliance.getVariableDelay = () => 0;
+  await client.sendMessage('5511999999999', 'Teste de envio');
 
-  await dispatcher.dispatch('5511999999999', 'Teste de envio', false);
-
-  assert.ok(waitCalled, 'Expected waitUntilReady to be called');
   assert.ok(sendCalled, 'Expected sendMessage to be called');
 
   console.log('READY -> SEND test passed.');

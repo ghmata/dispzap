@@ -83,8 +83,8 @@ class SessionManager {
     const client = this.sessions.get(id);
     if (!client) return;
     try {
-      if (client.client && typeof client.client.destroy === 'function') {
-        await client.client.destroy();
+      if (typeof client.shutdown === 'function') {
+        await client.shutdown();
       }
     } catch (err) {
       logger.error(`Error destroying session ${id}: ${err.message}`);

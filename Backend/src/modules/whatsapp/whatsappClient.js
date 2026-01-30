@@ -1,115 +1,163 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
 const EventEmitter = require('events');
+const qrcode = require('qrcode-terminal');
+const config = require('../../../config.json');
 const logger = require('../utils/logger');
-const pathHelper = require('../utils/pathHelper');
+
+const STATES = {
+  INIT: 'INIT',
+  AUTHENTICATING: 'AUTHENTICATING',
+  CONNECTED: 'CONNECTED',
+  READY: 'READY',
+  IDLE: 'IDLE',
+  SENDING: 'SENDING',
+  COOLDOWN: 'COOLDOWN',
+  DISCONNECTED: 'DISCONNECTED',
+  ERROR: 'ERROR'
+};
 
 class WhatsAppClient extends EventEmitter {
-  constructor(id) {
+  constructor(id, options = {}) {
     super();
     this.id = id;
-    this.status = 'DISCONNECTED'; // DISCONNECTED, CONNECTING, AUTHENTICATED, READY, SENDING, ERROR
+    this.status = STATES.INIT;
     this.lastStatusChangeAt = Date.now();
-    
-    // Ensure portable session path
-    const sessionPath = pathHelper.getSessionsDir();
+    this.lastQr = null;
+    this.cooldownUntil = null;
+    this.sendHistory = [];
+    this.reconnectAttempts = 0;
+    this.idleTimer = null;
 
-    this.client = new Client({
-      authStrategy: new LocalAuth({
-        clientId: id,
-        dataPath: sessionPath
-      }),
-      // Reverted: v1.26.0 should work natively. Forcing old version might be the issue.
-      webVersionCache: {
-        type: 'remote',
-        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-      },
-      puppeteer: {
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--disable-gpu'
-        ]
-      }
-    });
+    this.complianceConfig = {
+      maxMessagesPerHour: config.compliance.maxMessagesPerHour || 50,
+      maxMessagesPerDay: config.compliance.maxMessagesPerDay || 300,
+      minDelay: config.compliance.minDelay || 30000,
+      maxDelay: config.compliance.maxDelay || 90000,
+      ...options.complianceConfig
+    };
 
-    this._bindEvents();
+    this.maxReconnects = options.maxReconnects || 5;
+    this.provider = options.provider || this._buildDefaultProvider(options.providerOptions);
+    this._bindProviderEvents();
   }
 
-  _setStatus(status) {
-    if (this.status === status) return;
-    this.status = status;
-    this.lastStatusChangeAt = Date.now();
-    this.emit('status', { id: this.id, status });
+  _buildDefaultProvider(providerOptions) {
+    // Lazy require to avoid loading Baileys in unit tests that inject a mock provider.
+    // eslint-disable-next-line global-require
+    const BaileysProvider = require('./providers/baileysProvider');
+    return new BaileysProvider(this.id, providerOptions);
   }
 
-  _bindEvents() {
-    this.client.on('qr', (qr) => {
-      this._setStatus('QR');
-      this.lastQr = qr; // Persist QR for API retrieval
+  _bindProviderEvents() {
+    this.provider.on('qr', (qr) => {
+      this.lastQr = qr;
+      this._transition(STATES.AUTHENTICATING, 'qr_received');
       logger.info(`[${this.id}] QR Code received. Please scan.`);
       qrcode.generate(qr, { small: true });
+      this.emit('qr', qr);
     });
 
-    this.client.on('loading_screen', (percent, message) => {
-      this._setStatus('LOADING');
-      logger.info(`[${this.id}] Loading WhatsApp Web: ${percent}% - ${message}`);
+    this.provider.on('creds.update', () => {
+      logger.info(`[${this.id}] Credentials updated.`);
     });
 
-    this.client.on('ready', () => {
-      this._setStatus('READY');
-      this.lastQr = null;
-      logger.info(`[${this.id}] Client is ready!`);
-    });
+    this.provider.on('connection.update', (update) => {
+      const { connection, lastDisconnect } = update;
+      if (connection === 'open') {
+        this.reconnectAttempts = 0;
+        this._transition(STATES.CONNECTED, 'connection_open');
+        this._transition(STATES.READY, 'ready');
+        this._scheduleIdle();
+      }
 
-    this.client.on('authenticated', () => {
-      this._setStatus('AUTHENTICATED');
-      logger.info(`[${this.id}] Client authenticated.`);
-      
-      // Fallback: If READY doesn't fire in 30s, check if we can actually use the client
-      // WARNING: Forcing READY without the event caused crashes (sendSeen undefined).
-      // We will only log the delay, not force state.
-      setTimeout(async () => {
-          if (this.status === 'AUTHENTICATED') {
-              logger.warn(`[${this.id}] WAITING FOR READY... (Client stalled at AUTHENTICATED). This usually means the session is corrupt or WWebJS needs an update.`);
-          }
-      }, 30000);
+      if (connection === 'close') {
+        const reason = lastDisconnect?.error?.output?.statusCode;
+        this._transition(STATES.DISCONNECTED, `connection_close:${reason || 'unknown'}`);
+        this._handleReconnect(reason);
+      }
     });
+  }
 
-    this.client.on('auth_failure', (msg) => {
-      this._setStatus('ERROR');
-      logger.error(`[${this.id}] Authentication failure: ${msg}`);
-    });
+  _handleReconnect(reason) {
+    if (this.provider.isLoggedOut && this.provider.isLoggedOut()) {
+      this._transition(STATES.ERROR, 'logged_out');
+      logger.error(`[${this.id}] Logged out. Session invalidated.`);
+      return;
+    }
 
-    this.client.on('change_state', (state) => {
-      logger.info(`[${this.id}] Connection state changed: ${state}`);
-      // If phone disconnects, state might go to TIMEOUT or unknown
-    });
+    this.reconnectAttempts += 1;
+    if (this.reconnectAttempts > this.maxReconnects) {
+      this._transition(STATES.ERROR, 'reconnect_exceeded');
+      logger.error(`[${this.id}] Reconnect attempts exceeded. Blocking sends.`);
+      return;
+    }
 
-    this.client.on('disconnected', (reason) => {
-      this._setStatus('DISCONNECTED');
-      logger.warn(`[${this.id}] Client disconnected: ${reason}`);
-    });
+    const jitter = this._randomDelay(5000, 15000);
+    logger.warn(`[${this.id}] Reconnecting in ${jitter}ms (attempt ${this.reconnectAttempts}).`);
+    setTimeout(() => {
+      this.initialize().catch((error) => {
+        logger.error(`[${this.id}] Reconnect failed: ${error.message}`);
+      });
+    }, jitter);
+  }
+
+  _transition(nextState, reason = 'manual') {
+    if (this.status === nextState) return;
+
+    const allowed = {
+      [STATES.INIT]: [STATES.AUTHENTICATING, STATES.ERROR],
+      [STATES.AUTHENTICATING]: [STATES.CONNECTED, STATES.ERROR, STATES.DISCONNECTED],
+      [STATES.CONNECTED]: [STATES.READY, STATES.ERROR, STATES.DISCONNECTED],
+      [STATES.READY]: [STATES.SENDING, STATES.IDLE, STATES.COOLDOWN, STATES.ERROR, STATES.DISCONNECTED],
+      [STATES.IDLE]: [STATES.READY, STATES.SENDING, STATES.COOLDOWN, STATES.ERROR, STATES.DISCONNECTED],
+      [STATES.SENDING]: [STATES.COOLDOWN, STATES.READY, STATES.ERROR, STATES.DISCONNECTED],
+      [STATES.COOLDOWN]: [STATES.READY, STATES.IDLE, STATES.ERROR, STATES.DISCONNECTED],
+      [STATES.DISCONNECTED]: [STATES.AUTHENTICATING, STATES.ERROR],
+      [STATES.ERROR]: [STATES.AUTHENTICATING, STATES.DISCONNECTED]
+    };
+
+    if (!allowed[this.status]?.includes(nextState)) {
+      logger.warn(`[${this.id}] Invalid transition ${this.status} -> ${nextState} (${reason}).`);
+      this.status = STATES.ERROR;
+      this.lastStatusChangeAt = Date.now();
+      this.emit('status', { id: this.id, status: this.status, reason: 'invalid_transition' });
+      return;
+    }
+
+    const previous = this.status;
+    this.status = nextState;
+    this.lastStatusChangeAt = Date.now();
+    logger.info(`[${this.id}] State change ${previous} -> ${nextState} (${reason}).`);
+    this.emit('status', { id: this.id, status: nextState, reason });
+  }
+
+  _scheduleIdle() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+    }
+    this.idleTimer = setTimeout(() => {
+      if (this.status === STATES.READY) {
+        this._transition(STATES.IDLE, 'idle_timeout');
+      }
+    }, 15000);
+  }
+
+  _randomDelay(min, max) {
+    return Math.floor(min + Math.random() * (max - min));
   }
 
   async initialize() {
     logger.info(`[${this.id}] Initializing...`);
-    this._setStatus('CONNECTING');
+    this._transition(STATES.AUTHENTICATING, 'initialize');
     try {
-      await this.client.initialize();
+      await this.provider.initialize();
     } catch (error) {
       logger.error(`[${this.id}] Init error: ${error.message}`);
-      this._setStatus('ERROR');
+      this._transition(STATES.ERROR, 'init_error');
     }
   }
 
   waitUntilReady({ timeoutMs = 60000 } = {}) {
-    if (this.status === 'READY') {
+    if (this.status === STATES.READY || this.status === STATES.IDLE) {
       return Promise.resolve(true);
     }
 
@@ -120,7 +168,7 @@ class WhatsAppClient extends EventEmitter {
       }, timeoutMs);
 
       const handleStatus = ({ status }) => {
-        if (status === 'READY') {
+        if (status === STATES.READY || status === STATES.IDLE) {
           clearTimeout(timeoutId);
           this.removeListener('status', handleStatus);
           resolve(true);
@@ -131,60 +179,125 @@ class WhatsAppClient extends EventEmitter {
     });
   }
 
-  async sendMessage(to, message) {
-    if (this.status !== 'READY') {
-      throw new Error(`Client ${this.id} is not ready (Status: ${this.status})`);
+  async sendMessage(rawNumber, message) {
+    if (this.status === STATES.IDLE) {
+      this._transition(STATES.READY, 'send_prepare');
     }
 
-    this._setStatus('SENDING');
-    
-    // Resolve ID to avoid "No LID" error
-    let chatId = to;
-    
-    // If it looks like a phone number (digits only or digits+@c.us)
-    const cleanNumber = to.replace('@c.us', '');
-    if (/^\d+$/.test(cleanNumber)) {
-        try {
-            const registered = await this.client.getNumberId(cleanNumber);
-            if (registered) {
-                chatId = registered._serialized;
-            } else {
-                logger.warn(`[${this.id}] Number ${cleanNumber} not registered on WhatsApp. Attempting to send anyway...`);
-                chatId = `${cleanNumber}@c.us`;
-            }
-        } catch (e) {
-            logger.warn(`[${this.id}] ID Resolution failed for ${cleanNumber}: ${e.message}`);
-             // If resolution fails, fallback to standard format
-             chatId = `${cleanNumber}@c.us`;
-        }
+    if (this.status !== STATES.READY) {
+      const error = new Error(`Client ${this.id} is not ready (Status: ${this.status})`);
+      logger.warn(`[${this.id}] Send blocked: ${error.message}`);
+      throw error;
     }
+
+    this._enforceCooldown();
+    this._enforceRateLimit();
+
+    this._transition(STATES.SENDING, 'send_attempt');
+    logger.info(`[${this.id}] Sending attempt to ${rawNumber}.`);
 
     try {
-      const result = await this.client.sendMessage(chatId, message);
-      this._setStatus('READY');
+      const { jid, exists } = await this.provider.validateNumber(rawNumber);
+      if (!exists) {
+        this._transition(STATES.ERROR, 'number_not_registered');
+        throw new Error(`Number ${rawNumber} is not registered on WhatsApp`);
+      }
+
+      const result = await this.provider.sendMessage(jid, message);
+      this._registerSend();
+      this._transition(STATES.READY, 'send_success');
+      this._scheduleIdle();
+      logger.info(`[${this.id}] Message sent to ${jid}.`);
       return result;
     } catch (error) {
-      this._setStatus('ERROR');
+      this._transition(STATES.ERROR, 'send_failure');
+      logger.error(`[${this.id}] Send error: ${error.message}`);
       throw error;
     }
   }
 
+  _enforceCooldown() {
+    if (!this.cooldownUntil) return;
+    const now = Date.now();
+    if (now < this.cooldownUntil) {
+      const remaining = this.cooldownUntil - now;
+      this._transition(STATES.COOLDOWN, 'cooldown_active');
+      logger.warn(`[${this.id}] Cooldown active for ${remaining}ms. Blocking send.`);
+      throw new Error(`Cooldown active (${remaining}ms remaining)`);
+    }
+    this.cooldownUntil = null;
+    if (this.status === STATES.COOLDOWN) {
+      this._transition(STATES.READY, 'cooldown_complete');
+    }
+  }
+
+  _enforceRateLimit() {
+    const now = Date.now();
+    const hourWindow = now - 60 * 60 * 1000;
+    const dayWindow = now - 24 * 60 * 60 * 1000;
+
+    this.sendHistory = this.sendHistory.filter((ts) => ts >= dayWindow);
+    const hourlyCount = this.sendHistory.filter((ts) => ts >= hourWindow).length;
+    const dailyCount = this.sendHistory.length;
+
+    if (hourlyCount >= this.complianceConfig.maxMessagesPerHour) {
+      const oldest = this.sendHistory.filter((ts) => ts >= hourWindow)[0];
+      const nextAllowed = oldest + 60 * 60 * 1000;
+      this._setCooldownUntil(nextAllowed, 'rate_limit_hour');
+      throw new Error('Hourly rate limit reached');
+    }
+
+    if (dailyCount >= this.complianceConfig.maxMessagesPerDay) {
+      const oldest = this.sendHistory[0];
+      const nextAllowed = oldest + 24 * 60 * 60 * 1000;
+      this._setCooldownUntil(nextAllowed, 'rate_limit_day');
+      throw new Error('Daily rate limit reached');
+    }
+  }
+
+  _setCooldownUntil(timestamp, reason) {
+    const jitter = this._randomDelay(3000, 12000);
+    this.cooldownUntil = timestamp + jitter;
+    this._transition(STATES.COOLDOWN, reason);
+    logger.warn(`[${this.id}] Cooldown engaged until ${new Date(this.cooldownUntil).toISOString()} (${reason}).`);
+  }
+
+  _registerSend() {
+    this.sendHistory.push(Date.now());
+  }
+
+  async enterCooldown(durationMs, reason = 'post_send_cooldown') {
+    if (!durationMs) return;
+    const now = Date.now();
+    this.cooldownUntil = Math.max(this.cooldownUntil || 0, now + durationMs);
+    this._transition(STATES.COOLDOWN, reason);
+    logger.info(`[${this.id}] Cooldown for ${durationMs}ms (${reason}).`);
+    await new Promise((resolve) => setTimeout(resolve, durationMs));
+    if (this.status === STATES.COOLDOWN) {
+      this._transition(STATES.READY, 'cooldown_complete');
+      this._scheduleIdle();
+    }
+  }
+
   isReady() {
-    return this.status === 'READY';
+    return this.status === STATES.READY || this.status === STATES.IDLE;
   }
 
   getPhoneNumber() {
-      if (this.client && this.client.info && this.client.info.wid) {
-          return this.client.info.wid.user;
-      }
-      return null;
+    return this.provider.getPhoneNumber();
   }
 
   getDisplayName() {
-      if (this.client && this.client.info && this.client.info.pushname) {
-          return this.client.info.pushname;
-      }
-      return null;
+    return this.provider.getDisplayName();
+  }
+
+  async shutdown() {
+    try {
+      await this.provider.destroy();
+    } catch (error) {
+      logger.error(`[${this.id}] Shutdown error: ${error.message}`);
+    }
+    this._transition(STATES.DISCONNECTED, 'shutdown');
   }
 }
 

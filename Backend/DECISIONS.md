@@ -20,9 +20,9 @@
 **Motivo:** Evitar banimentos por tentativa de envio para números inexistentes/fixos. Se o usuário digitar sem "55", o sistema adiciona. Se digitar algo fora do padrão móvel (celular), rejeita.
 **Impacto:** Maior confiabilidade na taxa de entrega.
 
-## 5. Wrapper wweb.js (Day 2)
-**Decisão:** Criação de classe `WhatsAppClient` encapsulando a lib.
-**Motivo:** Abstrair a complexidade de eventos do `whatsapp-web.js` e forçar o uso de `pathHelper` para persistência (`LocalAuth`), garantindo que nenhum dev futuro use caminhos absolutos acidentalmente.
+## 5. Abstração de Provider (Baileys)
+**Decisão:** `WhatsAppClient` passou a encapsular uma interface `WhatsAppProvider` com implementação `BaileysProvider`.
+**Motivo:** Desacoplar a lógica anti-ban e a state machine do provedor WhatsApp, permitindo troca futura de biblioteca sem reescrever o domínio.
 
 ## 6. Persistência de Sessão
 **Decisão:** Armazenamento em pastas separadas (`data/sessions/{id}`) por chip.
