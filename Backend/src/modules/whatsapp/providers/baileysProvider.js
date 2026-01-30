@@ -125,9 +125,10 @@ class BaileysProvider extends WhatsAppProvider {
   _mapReceiptStatus(status) {
     const mapping = {
       1: 'SENT',
-      2: 'DELIVERED',
-      3: 'READ',
-      4: 'PLAYED'
+      2: 'SERVER_ACK',
+      3: 'DELIVERED',
+      4: 'READ',
+      5: 'PLAYED'
     };
     return mapping[status] || null;
   }
