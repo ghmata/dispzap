@@ -48,6 +48,7 @@ export function ChipCard({ session, qrCode, onStatusChange }: ChipCardProps) {
       case "LOADING":
       case "CONNECTING":
       case "AUTHENTICATED":
+      case "SYNCING":
         return "border-yellow-500/50 hover:border-yellow-500";
       case "DISCONNECTED":
       case "ERROR":
@@ -75,6 +76,7 @@ export function ChipCard({ session, qrCode, onStatusChange }: ChipCardProps) {
       case "LOADING":
       case "CONNECTING":
       case "AUTHENTICATED":
+      case "SYNCING":
         return (
           <Badge className="bg-yellow-500/20 text-yellow-400 border-yellow-500/30">
             Conectando...
@@ -130,19 +132,19 @@ export function ChipCard({ session, qrCode, onStatusChange }: ChipCardProps) {
         </div>
 
         {/* QR Code Display */}
-        {(session.status === "QR" || session.status === "LOADING" || session.status === "SYNCING" || session.status === "CONNECTING" || session.status === "AUTHENTICATED") && (
+        {(qrCode || session.status === "QR" || session.status === "LOADING" || session.status === "SYNCING" || session.status === "CONNECTING" || session.status === "AUTHENTICATED") && (
           <div className="mb-4 flex flex-col items-center justify-center rounded-lg bg-white p-4">
-            {session.status === "SYNCING" ? (
-                <div className="flex flex-col h-32 w-32 items-center justify-center gap-2">
-                     <Loader2 className="h-8 w-8 animate-spin text-green-500" />
-                     <span className="text-xs text-green-600 font-semibold text-center">Sincronizando...</span>
-                </div>
-            ) : qrCode ? (
+            {qrCode ? (
               <img
                 src={qrCode || "/placeholder.svg"}
                 alt="QR Code"
                 className="h-32 w-32"
               />
+            ) : session.status === "SYNCING" ? (
+                <div className="flex flex-col h-32 w-32 items-center justify-center gap-2">
+                     <Loader2 className="h-8 w-8 animate-spin text-green-500" />
+                     <span className="text-xs text-green-600 font-semibold text-center">Sincronizando...</span>
+                </div>
             ) : (
               <div className="flex flex-col h-32 w-32 items-center justify-center gap-2">
                 {session.status === "LOADING" || session.status === "CONNECTING" || session.status === "AUTHENTICATED" ? (
@@ -156,9 +158,11 @@ export function ChipCard({ session, qrCode, onStatusChange }: ChipCardProps) {
               </div>
             )}
             <p className="mt-2 text-xs text-gray-600 text-center">
-              {session.status === "SYNCING" 
-                  ? "Aguarde a sincronização das mensagens..." 
-                  : (qrCode ? "Escaneie o QR Code com o WhatsApp" : "Aguarde...")}
+              {qrCode
+                ? "Escaneie o QR Code com o WhatsApp"
+                : session.status === "SYNCING"
+                  ? "Aguarde a sincronização das mensagens..."
+                  : "Aguarde..."}
             </p>
           </div>
         )}

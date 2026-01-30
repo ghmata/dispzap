@@ -1,11 +1,17 @@
 const fs = require('fs');
-const path = require('path');
 const logger = require('../utils/logger');
 const ExcelParser = require('../parser/excelParser');
 const Dispatcher = require('../dispatch/dispatcher');
 const SessionManager = require('../whatsapp/sessionManager');
 const LoadBalancer = require('../whatsapp/loadBalancer');
 const PathHelper = require('../utils/pathHelper');
+const {
+  createCampaignId,
+  createContactId,
+  createMessageId,
+  buildCorrelationId,
+  formatCorrelationTag
+} = require('../utils/correlation');
 
 class CampaignManager {
   constructor() {
@@ -15,6 +21,9 @@ class CampaignManager {
     this.parser = new ExcelParser();
     this.stateFile = PathHelper.resolve('data', 'campaign_state.json');
     this.isPaused = false;
+    this.eventEmitter = null;
+    this.currentState = null;
+    this.messageHandlers = new Map();
   }
 
   /**
@@ -28,7 +37,13 @@ class CampaignManager {
         logger.error(`Failed to load state: ${err.message}`);
       }
     }
-    return { processedRows: [], failedRows: [], pendingRows: [] };
+    return {
+      campaignId: null,
+      processedRows: [],
+      failedRows: [],
+      pendingRows: [],
+      messageStatus: {}
+    };
   }
 
   saveState(state) {
@@ -41,6 +56,8 @@ class CampaignManager {
   async initialize() {
     logger.info('Initializing Campaign Manager...');
     await this.sessionManager.loadSessions();
+
+    this._attachMessageHandlers();
     
     // Wait for at least one READY session before allowing dispatch
     let sessions;
@@ -68,8 +85,15 @@ class CampaignManager {
    * @param {string} excelPath 
    * @param {string} messageTemplate 
    */
-  async startCampaign(excelPath, messageTemplate, originalFilename) {
+  async startCampaign(excelPath, messageTemplate, originalFilename, options = {}) {
+    const campaignId = options.campaignId || createCampaignId();
+    const delayConfig = {
+      minDelay: options.delayMin,
+      maxDelay: options.delayMax
+    };
     let state = this.loadState();
+    state.campaignId = campaignId;
+    this.currentState = state;
     
     // 1. Parse Excel
     const parseResult = await this.parser.parse(excelPath, originalFilename);
@@ -81,7 +105,12 @@ class CampaignManager {
     
     // 2. Filter already processed
     const toProcess = allContacts.filter(c => !state.processedRows.includes(c.row));
-    logger.info(`Starting campaign. Total: ${allContacts.length}, Remaining: ${toProcess.length}`);
+    this._emitEvent('campaign_started', {
+      campaignId,
+      totalContacts: allContacts.length,
+      remaining: toProcess.length
+    });
+    logger.info(`${formatCorrelationTag(campaignId)} Starting campaign. Total: ${allContacts.length}, Remaining: ${toProcess.length}`);
 
     // 3. Process Loop
     for (const contact of toProcess) {
@@ -91,21 +120,58 @@ class CampaignManager {
        }
 
        try {
-         // Dispatch
-         // Replace variables in template
-         let msg = messageTemplate
-           .replace('{nome}', contact.name || '')
-           .replace('{link}', contact.link || '');
-            // Dynamic replacement for other cols could go here
+         const contactId = createContactId(contact.row);
+         const clientMessageId = createMessageId();
+         const correlationId = buildCorrelationId({
+           campaignId,
+           contactId,
+           messageId: clientMessageId
+         });
+         const correlationTag = formatCorrelationTag(correlationId);
 
-         const result = await this.dispatcher.dispatch(contact.phone, msg); // Pass actual dispatch options
+         const variables = {
+           nome: contact.name,
+           telefone: contact.phone,
+           ...contact
+         };
+
+         const result = await this.dispatcher.dispatch({
+           phone: contact.phone,
+           messageTemplate,
+           variables,
+           correlation: {
+             campaignId,
+             contactId,
+             clientMessageId,
+             correlationId
+           },
+           delayConfig
+         });
+
+         state.messageStatus[clientMessageId] = {
+           campaignId,
+           contactId,
+           phone: contact.phone,
+           status: result.status,
+           updatedAt: new Date().toISOString()
+         };
+
+         this._emitEvent('message_status', {
+           campaignId,
+           contactId,
+           clientMessageId,
+           correlationId,
+           status: result.status,
+           phone: contact.phone
+         });
          
-         if (result.status === 'SENT') {
+         if (result.status === 'SERVER_ACK') {
             state.processedRows.push(contact.row);
-            logger.info(`Row ${contact.row} success -> ${contact.phone}`);
+            logger.info(`${correlationTag} Row ${contact.row} server ack -> ${contact.phone}`);
          }
        } catch (err) {
-         logger.error(`Failed Row ${contact.row} (${contact.phone}): ${err.message}`);
+         const contactId = createContactId(contact.row);
+         logger.error(`${formatCorrelationTag(buildCorrelationId({ campaignId, contactId }))} Failed Row ${contact.row} (${contact.phone}): ${err.message}`);
          state.failedRows.push({ row: contact.row, error: err.message });
          // We might mark as processed to skip next time, or keep to retry. 
          // For now, let's mark processed so we don't loop forever on bad numbers.
@@ -116,7 +182,51 @@ class CampaignManager {
        this.saveState(state);
     }
 
-    logger.info('Campaign execution finished or paused.');
+    this._emitEvent('campaign_finished', {
+      campaignId,
+      processed: state.processedRows.length,
+      failed: state.failedRows.length
+    });
+    logger.info(`${formatCorrelationTag(campaignId)} Campaign execution finished or paused.`);
+    return { campaignId };
+  }
+
+  setEventEmitter(emitter) {
+    this.eventEmitter = emitter;
+  }
+
+  _emitEvent(event, payload) {
+    if (this.eventEmitter && typeof this.eventEmitter.emit === 'function') {
+      this.eventEmitter.emit(event, payload);
+    }
+  }
+
+  _attachMessageHandlers() {
+    this.sessionManager.getAllSessions().forEach((client) => {
+      this.registerSessionClient(client);
+    });
+  }
+
+  registerSessionClient(client) {
+    if (!client || this.messageHandlers.has(client.id)) {
+      return;
+    }
+
+    const handler = (update) => {
+      const key = update.clientMessageId || update.messageId;
+      if (key && this.currentState?.messageStatus?.[key]) {
+        this.currentState.messageStatus[key] = {
+          ...this.currentState.messageStatus[key],
+          status: update.status,
+          updatedAt: new Date().toISOString()
+        };
+        this.saveState(this.currentState);
+      }
+      this._emitEvent('message_status', update);
+    };
+
+    client.on('message_status', handler);
+    this.messageHandlers.set(client.id, handler);
   }
 }
 

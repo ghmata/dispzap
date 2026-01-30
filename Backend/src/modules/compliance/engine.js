@@ -6,6 +6,20 @@ class ComplianceEngine {
     this.maxDelay = config.compliance.maxDelay || 90000;
   }
 
+  setDelayRange({ minDelay, maxDelay } = {}) {
+    if (Number.isFinite(minDelay)) {
+      this.minDelay = minDelay;
+    }
+    if (Number.isFinite(maxDelay)) {
+      this.maxDelay = maxDelay;
+    }
+    if (this.maxDelay < this.minDelay) {
+      const temp = this.minDelay;
+      this.minDelay = this.maxDelay;
+      this.maxDelay = temp;
+    }
+  }
+
   /**
    * Generates a random delay using Box-Muller transform for Normal Distribution.
    * This simulates human behavior better than flat random.

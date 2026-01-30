@@ -9,8 +9,8 @@ const fs = require('fs');
 
 const logger = require('../modules/utils/logger');
 const CampaignManager = require('../modules/campaign/campaignManager');
-const SessionManager = require('../modules/whatsapp/sessionManager');
 const PathHelper = require('../modules/utils/pathHelper');
+const { createCampaignId } = require('../modules/utils/correlation');
 
 // --- SINGLETONS ---
 // In a real app, we might use dependency injection, but here we instantiate singletons.
@@ -33,9 +33,10 @@ class ApiServer {
         methods: ["GET", "POST"]
       }
     });
-    
+
     this.upload = multer({ dest: PathHelper.resolve('data', 'uploads') });
     this.port = 3001;
+    campaignManager.setEventEmitter(this.io);
 
     this.setupMiddleware();
     this.setupRoutes();
@@ -50,10 +51,17 @@ class ApiServer {
   setupRoutes() {
     // GET /api/status - System Health & Stats
     this.app.get('/api/status', (req, res) => {
-        // Mock stats for now, in future read from DB or logs
+        const state = campaignManager.loadState();
+        const messageStatus = state.messageStatus || {};
+        const sentStatuses = new Set(['SERVER_ACK', 'SENT', 'DELIVERED', 'READ', 'PLAYED']);
+        const deliveredStatuses = new Set(['DELIVERED', 'READ', 'PLAYED']);
+        const totalSent = Object.values(messageStatus).filter((msg) => sentStatuses.has(msg.status)).length;
+        const delivered = Object.values(messageStatus).filter((msg) => deliveredStatuses.has(msg.status)).length;
+        const deliveryRate = totalSent ? Number(((delivered / totalSent) * 100).toFixed(1)) : 0;
         res.json({
             active_campaigns: campaignManager.isPaused ? 0 : (fs.existsSync(campaignManager.stateFile) ? 1 : 0),
-            total_sent: 0, // TODO: Read from campaign state
+            total_sent: totalSent,
+            delivery_rate: deliveryRate,
             queue_current: 0,
             queue_total: 0
         });
@@ -95,6 +103,7 @@ class ApiServer {
         if (!waClient) return;
         const id = waClient.id;
         const socketIo = this.io;
+        campaignManager.registerSessionClient(waClient);
 
         // Clean up previous listeners to avoid duplicates if any (simple approach)
         // In a full implementation we'd track listeners, but for now we assume fresh attach
@@ -137,7 +146,7 @@ class ApiServer {
                 this.attachClientListeners(waClient);
             }
 
-            res.json({ success: true, id });
+            res.json({ success: true, id, status: 'LOADING' });
             this.io.emit('session_change', { chipId: id, status: 'LOADING' });
 
         } catch (e) {
@@ -156,16 +165,23 @@ class ApiServer {
 
             // Move file to permanent location if needed, or parse directly
             logger.info(`API: Starting campaign with ${file.originalname}`);
+            const campaignId = createCampaignId();
+            const delayMinMs = Number.isFinite(Number(delayMin)) ? Number(delayMin) * 1000 : undefined;
+            const delayMaxMs = Number.isFinite(Number(delayMax)) ? Number(delayMax) * 1000 : undefined;
 
             // Async start (Fire and Forget)
             campaignManager.initialize().then(() => {
-                return campaignManager.startCampaign(file.path, message, file.originalname);
+                return campaignManager.startCampaign(file.path, message, file.originalname, {
+                  campaignId,
+                  delayMin: delayMinMs,
+                  delayMax: delayMaxMs
+                });
             }).catch(err => {
                 logger.error(`Campaign Background Error: ${err.message}`);
                 this.io.emit('log', `[ERROR] Campaign Failed: ${err.message}`);
             });
 
-            res.json({ success: true, message: 'Campaign started in background' });
+            res.json({ success: true, message: 'Campaign started in background', campaignId });
 
         } catch (e) {
             res.status(500).json({ error: e.message });

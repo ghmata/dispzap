@@ -26,6 +26,7 @@ class WhatsAppClient extends EventEmitter {
     this.sendHistory = [];
     this.reconnectAttempts = 0;
     this.idleTimer = null;
+    this.messageTracker = new Map();
 
     this.complianceConfig = {
       maxMessagesPerHour: config.compliance.maxMessagesPerHour || 50,
@@ -74,6 +75,16 @@ class WhatsAppClient extends EventEmitter {
         this._transition(STATES.DISCONNECTED, `connection_close:${reason || 'unknown'}`);
         this._handleReconnect(reason);
       }
+    });
+
+    this.provider.on('message.status', (update) => {
+      const tracked = this.messageTracker.get(update.messageId);
+      const payload = {
+        ...tracked,
+        ...update,
+        chipId: this.id
+      };
+      this.emit('message_status', payload);
     });
   }
 
@@ -179,7 +190,7 @@ class WhatsAppClient extends EventEmitter {
     });
   }
 
-  async sendMessage(rawNumber, message) {
+  async sendMessage(rawNumber, message, correlation = {}) {
     if (this.status === STATES.IDLE) {
       this._transition(STATES.READY, 'send_prepare');
     }
@@ -204,13 +215,40 @@ class WhatsAppClient extends EventEmitter {
       }
 
       const result = await this.provider.sendMessage(jid, message);
+      const messageId = result?.key?.id || result?.key?.id;
+      const remoteJid = result?.key?.remoteJid || jid;
+      if (messageId) {
+        this.messageTracker.set(messageId, {
+          ...correlation,
+          phone: rawNumber,
+          jid: remoteJid,
+          sentAt: Date.now()
+        });
+        this.emit('message_status', {
+          ...correlation,
+          messageId,
+          jid: remoteJid,
+          status: 'SERVER_ACK',
+          phone: rawNumber,
+          chipId: this.id
+        });
+      }
       this._registerSend();
       this._transition(STATES.READY, 'send_success');
       this._scheduleIdle();
       logger.info(`[${this.id}] Message sent to ${jid}.`);
-      return result;
+      return { messageId, jid: remoteJid, providerResult: result };
     } catch (error) {
       this._transition(STATES.ERROR, 'send_failure');
+      if (correlation && Object.keys(correlation).length > 0) {
+        this.emit('message_status', {
+          ...correlation,
+          status: 'FAILED',
+          phone: rawNumber,
+          chipId: this.id,
+          error: error.message
+        });
+      }
       logger.error(`[${this.id}] Send error: ${error.message}`);
       throw error;
     }

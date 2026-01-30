@@ -119,8 +119,8 @@ export async function getHourlyData(): Promise<HourlyData[]> {
     }
 }
 
-export async function createSession(): Promise<{ id: string; status: string }> {
-  return fetchClient<{ id: string; status: string }>('/session/new', { method: 'POST' });
+export async function createSession(): Promise<{ id: string; status?: string }> {
+  return fetchClient<{ id: string; status?: string }>('/session/new', { method: 'POST' });
 }
 
 export async function connectSession(chipId: string): Promise<{ success: boolean }> {

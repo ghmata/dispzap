@@ -45,6 +45,7 @@ interface SocketContextType {
   clearLogs: () => void;
   formatChipLabel: (session: Session) => string;
   addOptimisticSession: (session: Session) => void;
+  replaceOptimisticSession: (tempId: string, session: Session) => void;
 }
 
 const SocketContext = createContext<SocketContextType | null>(null);
@@ -61,6 +62,35 @@ export function SocketProvider({ children }: { children: ReactNode }) {
 
   const addOptimisticSession = useCallback((session: Session) => {
       setSessions((prev) => [...prev, session]);
+  }, []);
+
+  const replaceOptimisticSession = useCallback((tempId: string, session: Session) => {
+      setSessions((prev) => {
+        const withoutTemp = prev.filter((item) => item.id !== tempId);
+        const exists = withoutTemp.find((item) => item.id === session.id);
+        if (exists) {
+          return withoutTemp.map((item) => (item.id === session.id ? { ...item, ...session } : item));
+        }
+        return [...withoutTemp, session];
+      });
+  }, []);
+
+  const normalizeStatus = useCallback((status: string | undefined) => {
+      switch (status) {
+        case "AUTHENTICATING":
+          return "QR";
+        case "CONNECTED":
+          return "SYNCING";
+        case "IDLE":
+          return "READY";
+        case "SENDING":
+        case "COOLDOWN":
+          return "READY";
+        case "INIT":
+          return "LOADING";
+        default:
+          return status;
+      }
   }, []);
 
   // Utility to format label: "chip 1 - (11) 99999-9999"
@@ -106,12 +136,16 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         
         const res = await fetch(url);
         const data = await res.json();
+        const normalized = data.map((session: Session) => ({
+          ...session,
+          status: normalizeStatus(session.status) as SessionChange["status"],
+        }));
         // Use mergeSessions from session-store to handle updates
-        setSessions((prev) => mergeSessions(prev, data));
+        setSessions((prev) => mergeSessions(prev, normalized));
 
         // Restore QR codes from persistence (Fix for disappearing UI)
         const restoredQrs: Record<string, string> = {};
-        data.forEach((s: any) => {
+        normalized.forEach((s: any) => {
             if (s.qr) restoredQrs[s.id] = s.qr;
         });
         if (Object.keys(restoredQrs).length > 0) {
@@ -169,7 +203,11 @@ export function SocketProvider({ children }: { children: ReactNode }) {
             // Remove any temporary placeholders
             const cleanPrev = prev.filter(s => !s.id.startsWith("temp_"));
             
-            if (cleanPrev.find(s => s.id === chipId)) return cleanPrev;
+            if (cleanPrev.find(s => s.id === chipId)) {
+              return cleanPrev.map((s) =>
+                s.id === chipId ? { ...s, status: "QR" } : s
+              );
+            }
             // Add placeholder if completely new
              return [...cleanPrev, { 
                  id: chipId, 
@@ -180,8 +218,9 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     });
 
     socketInstance.on("session_change", ({ chipId, status }: { chipId: string; status: SessionChange["status"] }) => {
-        console.log(`[Socket] Session change for ${chipId}: ${status}`);
-        setSessionChanges((prev) => ({ ...prev, [chipId]: status }));
+        const normalizedStatus = normalizeStatus(status) as SessionChange["status"];
+        console.log(`[Socket] Session change for ${chipId}: ${normalizedStatus}`);
+        setSessionChanges((prev) => ({ ...prev, [chipId]: normalizedStatus }));
         
         // Update main list status synchronously
         setSessions((prev) => {
@@ -189,14 +228,14 @@ export function SocketProvider({ children }: { children: ReactNode }) {
             if (!exists) {
                 return [
                   ...prev,
-                  { id: chipId, status, displayOrder: prev.length + 1 },
+                  { id: chipId, status: normalizedStatus, displayOrder: prev.length + 1 },
                 ];
             }
-            return prev.map(s => s.id === chipId ? { ...s, status } : s);
+            return prev.map(s => s.id === chipId ? { ...s, status: normalizedStatus } : s);
         });
 
         // If ready, clear QR and refresh full data (to get phone number)
-        if (status === "READY" || status === "ONLINE") {
+        if (normalizedStatus === "READY" || normalizedStatus === "ONLINE") {
             setQrCodes((prev) => {
                 const newQrs = { ...prev };
                 delete newQrs[chipId];
@@ -225,7 +264,8 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         refreshSessions,
         clearLogs,
         formatChipLabel,
-        addOptimisticSession
+        addOptimisticSession,
+        replaceOptimisticSession
       }}
     >
       {children}
